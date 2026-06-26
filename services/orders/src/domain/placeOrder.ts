@@ -81,31 +81,75 @@ export const placeOrder = async (
     confirmedOrder = await deps.orders.markConfirmed(orderId);
   } catch (err) {
     if (isErrorCode(err, "INSUFFICIENT_STOCK")) {
-      await deps.orders.markFailed(orderId);
-      await invalidateOrderCache(deps.cache, orderId);
+      try {
+        await deps.orders.markFailed(orderId);
+        await invalidateOrderCache(deps.cache, orderId);
+      } catch (markFailedErr) {
+        // [Improvement]
+        // markFailed() 자체가 실패하면 원래 예외가 덮어써질 수 있으므로
+        // 별도로 로깅만 수행하고 원래 예외(err)를 그대로 유지한다.
+        deps.logger.error("failed to mark order as failed", {
+          ...orderCtx,
+          error:
+            markFailedErr instanceof Error
+              ? markFailedErr.message
+              : String(markFailedErr)
+        });
+      }
+
       throw err;
     }
 
     let compensationError: unknown;
+
     try {
       await compensateOrderFailure(deps, compensation);
     } catch (compErr) {
       compensationError = compErr;
+
       deps.logger.error("order compensation failed", {
         ...orderCtx,
         error: compErr instanceof Error ? compErr.message : String(compErr)
       });
     } finally {
-      await deps.orders.markFailed(orderId);
-      await invalidateOrderCache(deps.cache, orderId);
+      try {
+        await deps.orders.markFailed(orderId);
+        await invalidateOrderCache(deps.cache, orderId);
+      } catch (markFailedErr) {
+        // 주문 상태를 FAILED로 변경하는 과정이 실패해도 기존 예외를 덮어쓰지 않고 로그만 남긴다.
+        deps.logger.error("failed to mark order as failed", {
+          ...orderCtx,
+          error:
+            markFailedErr instanceof Error
+              ? markFailedErr.message
+              : String(markFailedErr)
+        });
+      }
     }
 
     if (compensationError) {
-      throw compensationError;
+      // 기존 구현은 compensationError만 throw하여실제 주문 실패 원인(err)을 잃어버렸다.
+      // AggregateError를 사용하여
+      // 1. 최초 장애 원인
+      // 2. Compensation 실패 원인
+      // 을 함께 전달해 장애 분석을 쉽게 한다.
+      deps.logger.error("order failed and compensation also failed", {
+        ...orderCtx,
+        originalError: err instanceof Error ? err.message : String(err),
+        compensationError:
+          compensationError instanceof Error
+            ? compensationError.message
+            : String(compensationError)
+      });
+
+      throw new AggregateError(
+        [err, compensationError],
+        "Order processing failed and compensation also failed."
+      );
     }
+
     throw err;
   }
-
   await invalidateOrderCache(deps.cache, orderId);
   if (!confirmedOrder) {
     throw orderError("ORDER_CONFIRMATION_MISSING", "Order confirmation was not recorded", 500, {
